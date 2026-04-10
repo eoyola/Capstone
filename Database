@@ -1,0 +1,430 @@
+package com.example.module3_2edgar;
+
+import android.content.Context;
+import android.content.ContentValues;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteOpenHelper;
+import android.util.Log;
+
+import androidx.annotation.Nullable;
+
+/*
+Enhancement 1 changes (Software Engineering and Design):
+    - Removed unused TABLE_DATA constant.
+    - Fixed unused userId variable, now insert result is now checked and logged.
+    - Fixed Cursor resource leak, so cursor is now closed in a finally block.
+    - Added input validation in addUser() and authenticateUser().
+    - Replaced raw string concatenation in authenticateUser() with a
+    parameterized query to eliminate the SQL injection vulnerability.
+    - Added a LOG_TAG constant for consistent logging.
+    - Added Javadoc comments EVERYWHERE.
+ */
+
+/*
+Enhancement 2 changes (Algorithms and Data Structures):
+    - Incremented DATABASE_VERSION to 2 to trigger onUpgrade()
+    - Added KEY_SALT and KEY_PASSWORD_HASH columns to the scheme
+    - Removed KEY_PASSWORD column — plain text passwords are no longer stored
+    - Updated addUser() to accept a pre-computed hash and salt from
+    PasswordUtils rather than a plain text password
+    - Updated authenticateUser() to retrieve the stored salt and hash,
+    then delegate verification to PasswordUtils.verifyPassword()
+    - Added getSaltForUser() to support the two-step login flow:
+    retrieve salt first, then verify hash
+ */
+
+/*
+Enhancement 3 changes (Databases):
+    - Incremented DATABASE_VERSION to 3
+    - Added is_locked and created_at columns to the users table to persist
+      lockout state across application restarts
+    - Added failed_attempts and last_attempt_time columns to users table
+      so the lockout algorithm survives process termination
+    - Added audit_log table to record every authentication event with
+      username, event type, and timestamp — providing traceability
+    - Replaced the destructive DROP + recreate onUpgrade() with a
+      non-destructive ALTER TABLE migration that preserves existing user data
+    - Added methods: logEvent(), setUserLockStatus(),
+      recordFailedAttemptInDb(), resetFailedAttemptsInDb(),
+      getFailedAttemptCount(), getLastAttemptTime()
+    - These methods allow AuthService to sync the in-memory
+      LoginAttemptTracker state to the database on every login event
+ */
+public class Database extends SQLiteOpenHelper {
+
+    // Tag used for Android log messages from this class
+    private static final String LOG_TAG = "Database";
+
+    // Increment this value whenever the scheme changes
+    private static final int DATABASE_VERSION = 3;
+
+    // Filename of the SQLite database stored on device
+    private static final String DATABASE_NAME = "Database.db";
+
+    // Name of the users table
+    private static final String TABLE_USERS = "users";
+
+    // Name of the audit log table
+    private static final String TABLE_AUDIT_LOG = "audit_log";
+
+    // Primary key column name
+    private static final String KEY_ID = "id";
+
+    // Username column name
+    private static final String KEY_USERNAME = "username";
+
+    // SHA-256 hash of (salt + password). Never stores the original password.
+    private static final String KEY_PASSWORD_HASH = "password_hash";
+    private static final String KEY_SALT = "salt";
+
+    // Persists lockout state across application restarts
+    private static final String KEY_IS_LOCKED = "is_locked";
+
+    // Count of consecutive failed login attempts
+    private static final String KEY_FAILED_ATTEMPTS = "failed_attempts";
+
+    // Unix timestamp (ms) of the most recent failed attempt
+    // Used to re-initialize LoginAttemptTracker state on app restart
+    private static final String KEY_LAST_ATTEMPT_TIME = "last_attempt_time";
+
+    // ISO-8601 timestamp of account creation
+    private static final String KEY_CREATED_AT = "created_at";
+
+    // ── audit_log table column names ─────────────────────────────────────────
+
+    // Primary key for the audit log
+    private static final String KEY_LOG_ID = "log_id";
+
+    // Username associated with the event (may be null for unknown usernames)
+    private static final String KEY_LOG_USERNAME = "username";
+
+    // Type of event
+    private static final String KEY_LOG_EVENT_TYPE = "event_type";
+
+    // ISO-8601 timestamp of the event, set by SQLite DEFAULT
+    private static final String KEY_LOG_TIMESTAMP = "timestamp";
+
+    /*
+    Defined as public constants so AuthService can reference them without
+    hardcoding strings at the call site.
+    */
+
+    public static final String EVENT_LOGIN_SUCCESS  = "LOGIN_SUCCESS";
+    public static final String EVENT_LOGIN_FAIL     = "LOGIN_FAIL";
+    public static final String EVENT_REGISTER       = "REGISTER";
+    public static final String EVENT_ACCOUNT_LOCKED = "ACCOUNT_LOCKED";
+
+    // SQL statement used to create the users table on first launch
+    private static final String CREATE_TABLE_USERS =
+            "CREATE TABLE " + TABLE_USERS + " ("
+                    + KEY_ID              + " INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    + KEY_USERNAME        + " TEXT NOT NULL UNIQUE, "
+                    + KEY_PASSWORD_HASH   + " TEXT NOT NULL, "
+                    + KEY_SALT            + " TEXT NOT NULL, "
+                    + KEY_IS_LOCKED       + " INTEGER NOT NULL DEFAULT 0, "
+                    + KEY_FAILED_ATTEMPTS + " INTEGER NOT NULL DEFAULT 0, "
+                    + KEY_LAST_ATTEMPT_TIME + " INTEGER NOT NULL DEFAULT 0, "
+                    + KEY_CREATED_AT      + " TEXT NOT NULL DEFAULT (datetime('now'))"
+                    + ")";
+
+    // Creates the audit_log table.
+    private static final String CREATE_TABLE_AUDIT_LOG =
+            "CREATE TABLE " + TABLE_AUDIT_LOG + " ("
+                    + KEY_LOG_ID         + " INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    + KEY_LOG_USERNAME   + " TEXT, "
+                    + KEY_LOG_EVENT_TYPE + " TEXT NOT NULL, "
+                    + KEY_LOG_TIMESTAMP  + " TEXT NOT NULL DEFAULT (datetime('now'))"
+                    + ")";
+
+    /*
+    Primary constructor used by the application.
+    The calling Activity or Application context.
+    */
+
+    public Database(Context context) {
+        super(context, DATABASE_NAME, null, DATABASE_VERSION);
+    }
+
+    // Secondary constructor provided for testing or dependency injection scenarios.
+
+    public Database(@Nullable Context context,
+                    @Nullable String name,
+                    @Nullable SQLiteDatabase.CursorFactory factory,
+                    int version) {
+        super(context, name, factory, version);
+    }
+
+    /*
+    Called by the framework when the database file does not yet exist.
+    Creates all required tables.
+    */
+
+    @Override
+    public void onCreate(SQLiteDatabase db) {
+        db.execSQL(CREATE_TABLE_USERS);
+        db.execSQL(CREATE_TABLE_AUDIT_LOG);
+    }
+
+    /*
+    Called when DATABASE_VERSION is incremented. Migrates existing data
+    to the new scheme. Currently, drops and recreates the users table.
+    */
+
+    @Override
+    public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+        if (oldVersion < 2) {
+            db.execSQL("DROP TABLE IF EXISTS " + TABLE_USERS);
+            db.execSQL(CREATE_TABLE_USERS);
+            Log.i(LOG_TAG, "Scheme upgraded from v1 to v2: users table recreated.");
+        }
+
+        // ALTER TABLE is used so existing user accounts are preserved.
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE " + TABLE_USERS
+                    + " ADD COLUMN " + KEY_IS_LOCKED + " INTEGER NOT NULL DEFAULT 0");
+            db.execSQL("ALTER TABLE " + TABLE_USERS
+                    + " ADD COLUMN " + KEY_FAILED_ATTEMPTS + " INTEGER NOT NULL DEFAULT 0");
+            db.execSQL("ALTER TABLE " + TABLE_USERS
+                    + " ADD COLUMN " + KEY_LAST_ATTEMPT_TIME + " INTEGER NOT NULL DEFAULT 0");
+            db.execSQL("ALTER TABLE " + TABLE_USERS
+                    + " ADD COLUMN " + KEY_CREATED_AT
+                    + " TEXT NOT NULL DEFAULT (datetime('now'))");
+            db.execSQL(CREATE_TABLE_AUDIT_LOG);
+            Log.i(LOG_TAG, "Scheme upgraded from v2 to v3: lockout columns and audit_log added.");
+        }
+    }
+
+    // Inserts a new user record with a pre-computed password hash and salt.
+    public boolean addUser(String username, String passwordHash, String salt) {
+        // Input validation
+        if (username == null || username.trim().isEmpty()) {
+            Log.w(LOG_TAG, "addUser() called with null or empty username.");
+            return false;
+        }
+        if (passwordHash == null || passwordHash.isEmpty()) {
+            Log.w(LOG_TAG, "addUser() called with null or empty password hash.");
+            return false;
+        }
+        if (salt == null || salt.isEmpty()) {
+            Log.w(LOG_TAG, "addUser() called with null or empty salt.");
+            return false;
+        }
+
+        SQLiteDatabase db = this.getWritableDatabase();
+
+        ContentValues values = new ContentValues();
+        values.put(KEY_USERNAME, username.trim());
+        values.put(KEY_PASSWORD_HASH, passwordHash);
+        values.put(KEY_SALT, salt);
+
+        // insert() returns the new row ID, or -1 if the insert failed
+        long rowId = db.insert(TABLE_USERS, null, values);
+        db.close();
+
+        if (rowId == -1) {
+            Log.w(LOG_TAG, "addUser() insert failed for username: " + username
+                    + ". Username may already exist.");
+            return false;
+        }
+
+        return true;
+    }
+
+    // Retrieves the stored salt for a given username.
+    public String getSaltForUser(String username) {
+        if (username == null || username.trim().isEmpty()) {
+            return null;
+        }
+
+        SQLiteDatabase db = this.getReadableDatabase();
+        String query = "SELECT " + KEY_SALT + " FROM " + TABLE_USERS
+                + " WHERE " + KEY_USERNAME + " = ?";
+
+        Cursor cursor = null;
+        try {
+            cursor = db.rawQuery(query, new String[]{ username.trim() });
+            if (cursor.moveToFirst()) {
+                return cursor.getString(cursor.getColumnIndexOrThrow(KEY_SALT));
+            }
+            return null;
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+            db.close();
+        }
+    }
+
+    /*
+    Verifies a username and password combination against the users table.
+    
+    Uses a parameterized query to prevent SQL injection. The username and
+    password are passed as bound parameters rather than embedded in the
+    query string.
+    */
+
+    public boolean authenticateUser(String username, String passwordHash) {
+        // Input validation
+        if (username == null || username.trim().isEmpty()) {
+            Log.w(LOG_TAG, "authenticateUser() called with null or empty username.");
+            return false;
+        }
+        if (passwordHash == null || passwordHash.isEmpty()) {
+            Log.w(LOG_TAG, "authenticateUser() called with null or empty password hash.");
+            return false;
+        }
+
+        SQLiteDatabase db = this.getReadableDatabase();
+        String query = "SELECT " + KEY_ID + " FROM " + TABLE_USERS
+                + " WHERE " + KEY_USERNAME + " = ? AND " + KEY_PASSWORD_HASH + " = ?";
+
+        Cursor cursor = null;
+        try {
+            cursor = db.rawQuery(query, new String[]{ username.trim(), passwordHash });
+            return cursor.moveToFirst();
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+            db.close();
+        }
+    }
+
+    public void setUserLockStatus(String username, boolean locked) {
+        if (username == null || username.trim().isEmpty()) {
+            return;
+        }
+
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(KEY_IS_LOCKED, locked ? 1 : 0);
+
+        db.update(TABLE_USERS, values,
+                KEY_USERNAME + " = ?",
+                new String[]{ username.trim() });
+        db.close();
+
+        Log.i(LOG_TAG, "Lock status set to " + locked + " for: " + username.trim());
+    }
+
+    /*
+    Increments the failed attempt counter and updates the last attempt
+    timestamp for a given username.
+    */
+
+    public void recordFailedAttemptInDb(String username) {
+        if (username == null || username.trim().isEmpty()) {
+            return;
+        }
+
+        SQLiteDatabase db = this.getWritableDatabase();
+
+        // Increment failed_attempts and set last_attempt_time
+        db.execSQL(
+                "UPDATE " + TABLE_USERS
+                        + " SET " + KEY_FAILED_ATTEMPTS + " = " + KEY_FAILED_ATTEMPTS + " + 1, "
+                        + KEY_LAST_ATTEMPT_TIME + " = ?"
+                        + " WHERE " + KEY_USERNAME + " = ?",
+                new Object[]{ System.currentTimeMillis(), username.trim() }
+        );
+        db.close();
+    }
+
+    // Resets the failed attempt counter and last attempt timestamp for a given username.
+    public void resetFailedAttemptsInDb(String username) {
+        if (username == null || username.trim().isEmpty()) {
+            return;
+        }
+
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(KEY_FAILED_ATTEMPTS, 0);
+        values.put(KEY_LAST_ATTEMPT_TIME, 0);
+        values.put(KEY_IS_LOCKED, 0);
+
+        db.update(TABLE_USERS, values,
+                KEY_USERNAME + " = ?",
+                new String[]{ username.trim() });
+        db.close();
+
+        Log.i(LOG_TAG, "Failed attempt counter reset for: " + username.trim());
+    }
+
+    // Returns the persisted failed attempt count for a username.
+    // Returns 0 if the username does not exist.
+    public int getFailedAttemptCount(String username) {
+        if (username == null || username.trim().isEmpty()) {
+            return 0;
+        }
+
+        SQLiteDatabase db = this.getReadableDatabase();
+        String query = "SELECT " + KEY_FAILED_ATTEMPTS + " FROM " + TABLE_USERS
+                + " WHERE " + KEY_USERNAME + " = ?";
+
+        Cursor cursor = null;
+        try {
+            cursor = db.rawQuery(query, new String[]{ username.trim() });
+            if (cursor.moveToFirst()) {
+                return cursor.getInt(cursor.getColumnIndexOrThrow(KEY_FAILED_ATTEMPTS));
+            }
+            return 0;
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+            db.close();
+        }
+    }
+
+    // Returns the persisted last attempt timestamp for a username.
+    // Returns 0 if the username does not exist.
+    public long getLastAttemptTime(String username) {
+        if (username == null || username.trim().isEmpty()) {
+            return 0;
+        }
+
+        SQLiteDatabase db = this.getReadableDatabase();
+        String query = "SELECT " + KEY_LAST_ATTEMPT_TIME + " FROM " + TABLE_USERS
+                + " WHERE " + KEY_USERNAME + " = ?";
+
+        Cursor cursor = null;
+        try {
+            cursor = db.rawQuery(query, new String[]{ username.trim() });
+            if (cursor.moveToFirst()) {
+                return cursor.getLong(cursor.getColumnIndexOrThrow(KEY_LAST_ATTEMPT_TIME));
+            }
+            return 0;
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+            db.close();
+        }
+    }
+
+
+    public void logEvent(String username, String eventType) {
+        if (eventType == null || eventType.isEmpty()) {
+            Log.w(LOG_TAG, "logEvent() called with null or empty eventType.");
+            return;
+        }
+
+        SQLiteDatabase db = this.getWritableDatabase();
+
+        ContentValues values = new ContentValues();
+        // username may be null for events where the username is unknown
+        values.put(KEY_LOG_USERNAME, username != null ? username.trim() : null);
+        values.put(KEY_LOG_EVENT_TYPE, eventType);
+        // timestamp defaults to datetime('now') via the scheme DEFAULT
+
+        long rowId = db.insert(TABLE_AUDIT_LOG, null, values);
+        db.close();
+
+        if (rowId == -1) {
+            Log.w(LOG_TAG, "logEvent() insert failed for event: " + eventType);
+        } else {
+            Log.i(LOG_TAG, "Audit log: [" + eventType + "] for user: " + username);
+        }
+    }
+}
