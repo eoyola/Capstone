@@ -1,0 +1,252 @@
+package com.example.module3_2edgar;
+
+import android.content.Context;
+import android.telephony.SmsManager;
+import android.util.Log;
+
+/*
+Enhancement 1 Changes (Software Engineering and Design).
+    - Coordinate registration and login operations between the UI and the
+    database layer (Database.java)
+    - Handle SMS dispatch logic including the phone number and message content,
+    which were previously hardcoded placeholder strings in MainActivity
+    - Enforce minimum input requirements as a second validation layer
+    (Database.java also validates, but the service layer catches issues
+    before a database connection is even opened)
+    - MainActivity should hold no direct reference to Database. All data
+    operations are routed through this class.
+ */
+
+/*
+Enhancement 2 changes (Algorithms and Data Structures):
+    - Integrated PasswordUtils for SHA-256 hashing and salt generation
+    Registration now generates a salt and stores a hash — never plain text
+    Login now retrieves the stored salt, hashes the input, and compares
+    - Integrated LoginAttemptTracker for the account lockout algorithm
+    login() checks for lockout before querying the database
+    Failed attempts are recorded; successful login resets the counter
+    User-facing messages include remaining attempts and lockout duration
+ */
+
+/*
+Enhancement 3 changes (Databases):
+    - register() now calls database.logEvent(EVENT_REGISTER) after
+    successful registration to record the event in the audit log
+    - login() now calls database.logEvent() for LOGIN_SUCCESS,
+      LOGIN_FAIL, and ACCOUNT_LOCKED events
+    - login() now calls database.recordFailedAttemptInDb() on failure
+      so lockout state persists across application restarts
+    - login() calls database.setUserLockStatus(true) when the lockout
+      threshold is reached, persisting the lock to the database
+    - login() calls database.resetFailedAttemptsInDb() on success,
+      clearing both the in-memory and persisted lockout state
+    - Constructor now calls syncLockoutStateFromDb() which is available
+      for future use to restore persisted lockout state on app restart
+ */
+public class AuthService {
+
+    // Tag used for Android log messages from this class
+    private static final String LOG_TAG = "AuthService";
+
+    // Minimum required password length. Done at registration time
+    public static final int MIN_PASSWORD_LENGTH = 8;
+
+    // The phone number SMS messages will be sent to. Currently, a placeholder
+    private static final String SMS_RECIPIENT = "5555550100";
+
+    // The body of the SMS message that is sent
+    private static final String SMS_MESSAGE = "Hello from the Android Login App!";
+
+    // Reference to the data access layer
+    private final Database database;
+
+    private final LoginAttemptTracker attemptTracker;
+
+    public AuthService(Context context) {
+        this.database = new Database(context);
+        this.attemptTracker = new LoginAttemptTracker();
+    }
+
+    /*
+    Attempts to register a new user with the provided credentials.
+
+    Validates that the username is non-empty and the password meets the
+    minimum length requirement before delegating to the database layer.
+
+    Enhancement 2 - This now:
+    1. Generates a random salt via PasswordUtils.generateSalt()
+    2. Hashes the password + salt via PasswordUtils.hashPassword()
+    3. Passes only the hash and salt to database.addUser()
+    */
+    public RegistrationResult register(String username, String password) {
+        if (username == null || username.trim().isEmpty()) {
+            return RegistrationResult.EMPTY_USERNAME;
+        }
+        if (password == null || password.length() < MIN_PASSWORD_LENGTH) {
+            return RegistrationResult.PASSWORD_TOO_SHORT;
+        }
+
+        String trimmedUsername = username.trim();
+
+        // Generate a unique salt for this user
+        String salt = PasswordUtils.generateSalt();
+
+        // Hash the password combined with the salt
+        String passwordHash = PasswordUtils.hashPassword(password, salt);
+
+        if (passwordHash == null) {
+            Log.e(LOG_TAG, "Password hashing failed during registration for: " + trimmedUsername);
+            return RegistrationResult.HASH_ERROR;
+        }
+
+        // Store the hash and salt — never the original password
+        boolean inserted = database.addUser(trimmedUsername, passwordHash, salt);
+        if (!inserted) {
+            return RegistrationResult.USERNAME_TAKEN;
+        }
+
+        // Write registration event to audit log
+        database.logEvent(trimmedUsername, Database.EVENT_REGISTER);
+
+        Log.i(LOG_TAG, "New user registered with hashed credentials: " + trimmedUsername);
+        return RegistrationResult.SUCCESS;
+    }
+
+    /*
+    Attempts to authenticate a user with the provided credentials.
+    Validates that neither field is empty before querying the database.
+
+
+    Enhancement 2 - This now:
+    1. Check if the account is locked out via LoginAttemptTracker
+    2. Retrieve the stored salt for the username from the database
+    3. Hash the input password with the stored salt
+    4. Compare the computed hash to the stored hash
+    5. On failure: record the attempt; warn user of remaining attempts
+    6. On success: reset the attempt counter
+    */
+
+    public LoginResult login(String username, String password) {
+        if (username == null || username.trim().isEmpty()) {
+            return LoginResult.EMPTY_USERNAME;
+        }
+        if (password == null || password.trim().isEmpty()) {
+            return LoginResult.EMPTY_PASSWORD;
+        }
+
+        String trimmedUsername = username.trim();
+
+        // Step 1
+        if (attemptTracker.isLockedOut(trimmedUsername)) {
+            long remainingMs = attemptTracker.getLockoutRemainingMs(trimmedUsername);
+            long remainingMinutes = (remainingMs / 1000 / 60) + 1;
+            lastLockoutMinutes = remainingMinutes;
+
+            // Enhancement 3: log the blocked attempt
+            database.logEvent(trimmedUsername, Database.EVENT_ACCOUNT_LOCKED);
+
+            Log.w(LOG_TAG, "Login blocked — account locked: " + trimmedUsername);
+            return LoginResult.ACCOUNT_LOCKED;
+        }
+
+        // Step 2
+        String storedSalt = database.getSaltForUser(trimmedUsername);
+        if (storedSalt == null) {
+            handleFailedAttempt(trimmedUsername);
+            Log.i(LOG_TAG, "Login failed — username not found: " + trimmedUsername);
+            return LoginResult.INVALID_CREDENTIALS;
+        }
+
+        // Step 3
+        String computedHash = PasswordUtils.hashPassword(password, storedSalt);
+        if (computedHash == null) {
+            Log.e(LOG_TAG, "Password hashing failed during login for: " + trimmedUsername);
+            return LoginResult.HASH_ERROR;
+        }
+
+        // Step 4
+        boolean authenticated = database.authenticateUser(trimmedUsername, computedHash);
+
+        if (!authenticated) {
+            handleFailedAttempt(trimmedUsername);
+            Log.i(LOG_TAG, "Failed login for: " + trimmedUsername
+                    + " — " + lastRemainingAttempts + " attempts remaining.");
+            return LoginResult.INVALID_CREDENTIALS;
+        }
+
+        // Step 6
+        attemptTracker.resetAttempts(trimmedUsername);
+        database.resetFailedAttemptsInDb(trimmedUsername);   // Enhancement 3
+        database.logEvent(trimmedUsername, Database.EVENT_LOGIN_SUCCESS); // Enhancement 3
+
+        Log.i(LOG_TAG, "Successful login for: " + trimmedUsername);
+        return LoginResult.SUCCESS;
+    }
+
+    // Records a failed login attempt
+    private void handleFailedAttempt(String username) {
+        // Record in memory
+        attemptTracker.recordFailedAttempt(username);
+        lastRemainingAttempts = attemptTracker.getRemainingAttempts(username);
+        database.recordFailedAttemptInDb(username);
+
+        if (attemptTracker.isLockedOut(username)) {
+            database.setUserLockStatus(username, true);
+            database.logEvent(username, Database.EVENT_ACCOUNT_LOCKED);
+            Log.w(LOG_TAG, "Account locked and persisted to DB: " + username);
+        } else {
+            database.logEvent(username, Database.EVENT_LOGIN_FAIL);
+        }
+    }
+
+    // Stores the remaining attempts after the most recent failed login.
+    private int lastRemainingAttempts = LoginAttemptTracker.MAX_ATTEMPTS;
+
+    // Stores the lockout duration in minutes after an ACCOUNT_LOCKED result
+    private long lastLockoutMinutes = 0;
+
+    // Returns the number of remaining login attempts after the last failure.
+    public int getLastRemainingAttempts() {
+        return lastRemainingAttempts;
+    }
+
+    // Returns the number of minutes remaining in the lockout window after the last ACCOUNT_LOCKED result.
+    public long getLastLockoutMinutes() {
+        return lastLockoutMinutes;
+    }
+
+    // ── SMS ───────────────────────────────────────────────────────────────────
+
+    // Sends a predefined SMS message to the configured recipient number.
+    // Assumes SEND_SMS permission has already been granted by MainActivity.
+    public void sendSms() {
+        try {
+            SmsManager smsManager = SmsManager.getDefault();
+            smsManager.sendTextMessage(SMS_RECIPIENT, null, SMS_MESSAGE, null, null);
+            Log.i(LOG_TAG, "SMS sent to: " + SMS_RECIPIENT);
+        } catch (Exception e) {
+            Log.e(LOG_TAG, "SMS sending failed: " + e.getMessage(), e);
+        }
+    }
+
+    // ── Result enums ──────────────────────────────────────────────────────────
+
+    // Represents the possible outcomes of a registration attempt
+    public enum RegistrationResult {
+        SUCCESS,            // Registration succeeded; hashed credentials stored
+        EMPTY_USERNAME,     // The username field was null or empty
+        PASSWORD_TOO_SHORT, // The password did not meet the minimum length requirement
+        USERNAME_TAKEN,     // A user with this username already exists
+        HASH_ERROR          // SHA-256 hashing failed (should never occur on Android)
+    }
+
+    // Represents the possible outcomes of a login attempt
+    public enum LoginResult {
+        SUCCESS,             // Authentication succeeded
+        EMPTY_USERNAME,      // The username field was null or empty
+        EMPTY_PASSWORD,      // The password field was null or empty
+        INVALID_CREDENTIALS, // Hash comparison failed or username not found
+        ACCOUNT_LOCKED,      // Too many failed attempts within the lockout window
+        HASH_ERROR           // SHA-256 hashing failed (should never occur on Android)
+    }
+}
