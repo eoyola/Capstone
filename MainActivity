@@ -1,0 +1,236 @@
+package com.example.module3_2edgar;
+
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.os.Bundle;
+import android.view.View;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.TextView;
+
+/*
+ Enhancement 1 changes (Software Engineering and Design):
+    - Removed direct reference to Database.
+    - Introduced AuthService as the application's login, registration,
+    and SMS logic is now delegated to AuthService.
+    - loginUser() and registerUser() will now handle all result cases
+    using the AuthService result enums, providing specific user feedback
+    for each failure condition rather than 1 basic error message.
+    - sendSMSMessage() now delegates to AuthService.sendSms(), and the
+    hardcoded "phoneNo" and "SMS message" placeholder strings have been
+    moved to named constants in AuthService.
+    - The empty else branch in onRequestPermissionsResult() now displays a
+    user facing message when SMS permission is denied.
+    - Removed the SmsManager import, so SMS logic no longer belongs in this class.
+    - Added Javadoc comments... a lot.
+ */
+
+/*
+Enhancement 2 changes (Algorithms and Data Structures):
+    - Added handling for two new LoginResult cases introduced by the
+    lockout algorithm: ACCOUNT_LOCKED and HASH_ERROR
+    - ACCOUNT_LOCKED message displays the remaining lockout duration
+    in minutes, retrieved from AuthService.getLastLockoutMinutes()
+    - INVALID_CREDENTIALS message now displays remaining attempts,
+    retrieved from AuthService.getLastRemainingAttempts(), so users
+    know how close they are to being locked out
+    - Added handling for RegistrationResult.HASH_ERROR
+ */
+
+public class MainActivity extends AppCompatActivity {
+
+    // Request code used to identify the SMS permission callback
+    private static final int REQUEST_SEND_SMS = 0;
+
+    // Input field for the username
+    private EditText nameText;
+
+    // Input field for the password
+    private EditText passwordText;
+
+    // Displays feedback messages to the user
+    private TextView textGreeting;
+
+    // Triggers a login attempt
+    private Button buttonLogin;
+
+    // Triggers a registration attempt
+    private Button buttonRegister;
+
+    // Triggers an SMS send
+    private Button buttonSendSMS;
+
+    /*
+    Handles all business logic for authentication and SMS delivery.
+    MainActivity holds no reference to Database directly.
+    */
+    private AuthService authService;
+
+    // Initializes the UI components, the AuthService instance, and all button click listeners.
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        // Initialize the service layer
+        authService = new AuthService(this);
+
+        // Bind UI components to their layout view IDs
+        nameText = (EditText)findViewById(R.id.username_edittext);
+        passwordText = (EditText)findViewById(R.id.password_edittext);
+        textGreeting = (TextView)findViewById(R.id.title_textview);
+        buttonLogin = (Button)findViewById(R.id.login_button);
+        buttonRegister = (Button)findViewById(R.id.create_account_button);
+        buttonSendSMS = (Button)findViewById(R.id.sendSMSbutton);
+
+        // Attach click listeners
+        buttonLogin.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                loginUser();
+            }
+        });
+
+        buttonRegister.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                registerUser();
+            }
+        });
+
+        buttonSendSMS.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                sendSMSMessage();
+            }
+        });
+    }
+
+    /*
+    Reads username and password fields and attempts a login attempt
+    to AuthService. Displays a specific message for each possible outcome.
+    */
+    private void loginUser() {
+        String username = nameText.getText().toString();
+        String password = passwordText.getText().toString();
+
+        AuthService.LoginResult result = authService.login(username, password);
+
+        switch (result) {
+            case SUCCESS:
+                textGreeting.setText("Hello, " + username.trim() + "!");
+                break;
+            case EMPTY_USERNAME:
+                textGreeting.setText("Please enter a username.");
+                break;
+            case EMPTY_PASSWORD:
+                textGreeting.setText("Please enter a password.");
+                break;
+            case INVALID_CREDENTIALS:
+                int remaining = authService.getLastRemainingAttempts();
+                if (remaining > 0) {
+                    textGreeting.setText("Incorrect username or password. "
+                            + remaining + " attempt(s) remaining before lockout.");
+                } else {
+                    textGreeting.setText("Incorrect username or password. "
+                            + "Account is now locked.");
+                }
+                break;
+            case ACCOUNT_LOCKED:
+                long minutes = authService.getLastLockoutMinutes();
+                textGreeting.setText("Account is locked due to too many failed attempts. "
+                        + "Please try again in " + minutes + " minute(s).");
+                break;
+            case HASH_ERROR:
+                textGreeting.setText("A system error occurred. Please try again.");
+                break;
+            default:
+                textGreeting.setText("Login failed. Please try again.");
+                break;
+        }
+    }
+
+    /*
+    Reads the username and password fields and delegates a registration
+    attempt to AuthService. Displays a specific message for each possible
+    outcome, including password length requirements and duplicate usernames.
+    */
+
+    private void registerUser() {
+        String username = nameText.getText().toString();
+        String password = passwordText.getText().toString();
+
+        AuthService.RegistrationResult result = authService.register(username, password);
+
+        switch (result) {
+            case SUCCESS:
+                textGreeting.setText("Registration successful. You may now log in.");
+                break;
+            case EMPTY_USERNAME:
+                textGreeting.setText("Please enter a username.");
+                break;
+            case PASSWORD_TOO_SHORT:
+                textGreeting.setText(
+                        "Password must be at least "
+                                + AuthService.MIN_PASSWORD_LENGTH
+                                + " characters.");
+                break;
+            case USERNAME_TAKEN:
+                textGreeting.setText("That username is already taken. Please choose another.");
+                break;
+            case HASH_ERROR:
+                textGreeting.setText("A system error occurred. Please try again.");
+                break;
+            default:
+                textGreeting.setText("Registration failed. Please try again.");
+                break;
+        }
+    }
+
+    /*
+    Checks whether the SEND_SMS permission has been granted.
+    If granted, delegates SMS dispatch to AuthService.
+    If not granted, requests the permission from the user.
+    */
+    protected void sendSMSMessage() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(
+                    this,
+                    new String[]{Manifest.permission.SEND_SMS},
+                    REQUEST_SEND_SMS);
+        } else {
+            authService.sendSms();
+            textGreeting.setText("SMS sent.");
+        }
+    }
+
+    /*
+    Receives the result of a runtime permission request.
+    If the SMS permission was granted, dispatches the SMS via AuthService.
+    If the permission was denied, informs the user with an explanatory message.
+    */
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode,
+                                           String[] permissions,
+                                           int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+
+        if (requestCode == REQUEST_SEND_SMS) {
+            if (grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                authService.sendSms();
+                textGreeting.setText("SMS sent.");
+            } else {
+                textGreeting.setText(
+                        "SMS permission denied. Please enable it in app settings to use this feature.");
+            }
+        }
+    }
+}
