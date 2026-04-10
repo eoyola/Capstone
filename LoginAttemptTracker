@@ -1,0 +1,129 @@
+package com.example.module3_2edgar;
+
+import android.util.Log;
+
+import java.util.HashMap;
+
+/*
+Enhancement 2 Intro (Algorithms and Data Structures):
+    This class implements the account lockout algorithm. It tracks failed
+    login attempts per username using a HashMap data structure and temporarily
+    locks accounts that go above the maximum allowed failures within a
+    time window.
+
+    MAX_ATTEMPTS is set to 5 and LOCKOUT_DURATION_MS to 15 minutes.
+ */
+public class LoginAttemptTracker {
+
+    // Tag used for Android log messages from this class
+    private static final String LOG_TAG = "LoginAttemptTracker";
+
+    // Maximum number of consecutive failed attempts before an account is locked
+    public static final int MAX_ATTEMPTS = 5;
+
+    // Duration of the lockout window in milliseconds (15 minutes)
+    public static final long LOCKOUT_DURATION_MS = 15 * 60 * 1000;
+
+    // Maps each username to its current AttemptRecord.
+    private final HashMap<String, AttemptRecord> attemptMap;
+
+    // Constructs a new LoginAttemptTracker with an empty attempt map.
+    public LoginAttemptTracker() {
+        this.attemptMap = new HashMap<>();
+    }
+
+    /* Returns true if the given username is currently locked out.
+
+    A username is locked if:
+        1. It has an AttemptRecord in the map, AND
+        2. Its failed attempt count has reached MAX_ATTEMPTS, AND
+        3. The time elapsed since the last failed attempt is less than LOCKOUT_DURATION_MS.
+    If the lockout window has expired, the method returns false, allowing the user to try again.
+     */
+    public boolean isLockedOut(String username) {
+        AttemptRecord record = attemptMap.get(username);
+
+        // No record means no failed attempts (not locked)
+        if (record == null) {
+            return false;
+        }
+
+        // Check if the lockout window has expired
+        long elapsed = System.currentTimeMillis() - record.lastAttemptTime;
+        if (elapsed >= LOCKOUT_DURATION_MS) {
+            // Lockout window expired (clear the method and allow access)
+            attemptMap.remove(username);
+            Log.i(LOG_TAG, "Lockout window expired for: " + username + ". Record cleared.");
+            return false;
+        }
+
+        // Within the lockout window (check if attempt count exceeds threshold)
+        return record.failedAttempts >= MAX_ATTEMPTS;
+    }
+
+    // Records a failed login attempt for the given username.
+    public void recordFailedAttempt(String username) {
+        AttemptRecord record = attemptMap.get(username);
+
+        if (record == null) {
+            // First failed attempt for this username
+            record = new AttemptRecord();
+            attemptMap.put(username, record);
+        }
+
+        record.failedAttempts++;
+        record.lastAttemptTime = System.currentTimeMillis();
+
+        if (record.failedAttempts >= MAX_ATTEMPTS) {
+            Log.w(LOG_TAG, "Account locked after " + record.failedAttempts
+                    + " failed attempts: " + username);
+        } else {
+            Log.i(LOG_TAG, "Failed attempt " + record.failedAttempts
+                    + " of " + MAX_ATTEMPTS + " for: " + username);
+        }
+    }
+
+    /*
+    Resets the failed attempt record for the given username.
+    Also, called after a successful login to clear any prior failed attempts.
+     */
+    public void resetAttempts(String username) {
+        if (attemptMap.containsKey(username)) {
+            attemptMap.remove(username);
+            Log.i(LOG_TAG, "Attempt record cleared after successful login: " + username);
+        }
+    }
+
+    // Returns the number of remaining attempts before lockout for a username. 0 = locked
+    public int getRemainingAttempts(String username) {
+        AttemptRecord record = attemptMap.get(username);
+        if (record == null) {
+            return MAX_ATTEMPTS;
+        }
+        int remaining = MAX_ATTEMPTS - record.failedAttempts;
+        return Math.max(remaining, 0);
+    }
+
+    // Returns the number of milliseconds remaining in the lockout window
+    public long getLockoutRemainingMs(String username) {
+        AttemptRecord record = attemptMap.get(username);
+        if (record == null || record.failedAttempts < MAX_ATTEMPTS) {
+            return 0;
+        }
+        long elapsed = System.currentTimeMillis() - record.lastAttemptTime;
+        long remaining = LOCKOUT_DURATION_MS - elapsed;
+        return Math.max(remaining, 0);
+    }
+
+    /* Internal data structure holding the failed attempt count and the
+    timestamp of the most recent failure for a single username.
+     */
+
+    static class AttemptRecord {
+        // Number of consecutive failed login attempts
+        int failedAttempts = 0;
+
+        // System.currentTimeMillis() timestamp of the most recent failure
+        long lastAttemptTime = 0;
+    }
+}
